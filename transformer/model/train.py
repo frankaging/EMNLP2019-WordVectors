@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from datasets import seq_collate_dict, load_dataset
-from models import MultiLSTM, MultiEDLSTM, MultiARLSTM, MultiCNNTransformer
+from models import ProbeLinear, ProbeTransformer
 
 from random import shuffle
 from operator import itemgetter
@@ -71,12 +71,12 @@ def generateInputChunkHelper(data_chunk, length_chunk):
 '''
 yielding training batch for the training process
 '''
-def generateTrainBatch(input_data, input_target, input_length, args, batch_size=25):
+def generateTrainBatch(input_data, input_target, input_length, args, batch_size=15):
     # TODO: support input_data as a dictionary
     # get chunk
-    input_size = len(input_data[list(input_data.keys())[0]]) # all values have same size
+    input_size = len(input_data)
     index = [i for i in range(0, input_size)]
-    # shuffle(index)
+    shuffle(index)
     shuffle_chunks = [i for i in chunks(index, batch_size)]
     for chunk in shuffle_chunks:
         # chunk yielding data
@@ -86,13 +86,13 @@ def generateTrainBatch(input_data, input_target, input_length, args, batch_size=
         length_chunk = [input_length[index] for index in chunk]
         # max length
         max_length = max(length_chunk)
-        # mod data generating
-        for mod in list(input_data.keys()):
-            data_chunk = [input_data[mod][index] for index in chunk]
-            data_chunk_sorted = \
-                generateInputChunkHelper(data_chunk, length_chunk)
-            data_chunk_sorted = data_chunk_sorted[:,:max_length,:,:]
-            yield_input_data[mod] = data_chunk_sorted
+
+        data_chunk = [input_data[index] for index in chunk]
+        data_chunk_sorted = \
+            generateInputChunkHelper(data_chunk, length_chunk)
+        data_chunk_sorted = data_chunk_sorted[:,:max_length,:]
+        yield_input_data = data_chunk_sorted
+
         # target generating
         target_sort = \
             generateInputChunkHelper(target_chunk, length_chunk)
@@ -121,10 +121,7 @@ def train(input_data, input_target, lengths, model, criterion, optimizer, epoch,
 
         # send to device
         mask = mask.to(args.device)
-        # send all data to the device
-        for mod in list(data.keys()):
-            # print(mod)
-            data[mod] = data[mod].to(args.device)
+        data = data.to(args.device)
         target = target.to(args.device)
         # lengths = lengths.to(args.device)
         # Run forward pass.
@@ -217,8 +214,7 @@ def evaluate(input_data, input_target, lengths, model, criterion, args, fig_path
         # send to device
         mask = mask.to(args.device)
         # send all data to the device
-        for mod in list(data.keys()):
-            data[mod] = data[mod].to(args.device)
+        data = data.to(args.device)
         target = target.to(args.device)
         # Run forward pass
         output = model(data, lengths, mask)
@@ -332,8 +328,8 @@ def save_params(args, model, train_stats, test_stats):
     df.set_index('model')
     df.to_csv(fname, mode='a', header=(not os.path.exists(fname)), sep='\t')
 
-def save_checkpoint(modalities, mod_dimension, window_size, model, path):
-    checkpoint = {'modalities': modalities, 'mod_dimension' : mod_dimension, 'window_size' : window_size, 'model': model.state_dict()}
+def save_checkpoint(modalities, mod_dimension, model, path):
+    checkpoint = {'modalities': modalities, 'mod_dimension' : mod_dimension, 'model': model.state_dict()}
     torch.save(checkpoint, path)
 
 def load_checkpoint(path, device):
@@ -343,6 +339,7 @@ def load_checkpoint(path, device):
 def load_data(modalities, data_dir, eval_dir=None):
     print("Loading data...")
     if eval_dir == None:
+        # TODO: change back to Train after finish debugging
         train_data = load_dataset(modalities, data_dir, 'Train',
                                 base_rate=args.base_rate,
                                 truncate=True, item_as_dict=True)
@@ -358,10 +355,12 @@ def load_data(modalities, data_dir, eval_dir=None):
     print("Loading Eval Set Done.")
     return eval_data
 
-def videoInputHelper(input_data, window_size, channel):
+'''
+This function will return the word level word vectors
+'''
+def videoInputHelper(input_data):
     # channel features
-    vectors_raw = input_data[channel]
-    ts = input_data[channel+"_timer"]
+    vectors_raw = input_data['linguistic']
     # remove nan values
     vectors = []
     for vec in vectors_raw:
@@ -372,124 +371,60 @@ def videoInputHelper(input_data, window_size, channel):
             else:
                 inner_vec.append(v)
         vectors.append(inner_vec)
+    return vectors
 
-    #  get the window size and repeat rate if oversample is needed
-    oversample = int(window_size[channel]/window_size['ratings'])
-    window_size = window_size[channel]
 
-    video_vs = []
-    count_v = 0
-    current_time = 0.0
-    window_vs = []
-    while count_v < len(vectors):
-        t = ts[count_v]
-        if type(t) == list:
-            t = t[0]
-        if t <= current_time + window_size:
-            window_vs.append(vectors[count_v])
-            count_v += 1
-        else:
-            for i in range(0, oversample):
-                video_vs.append(window_vs)
-            window_vs = []
-            current_time += window_size
-    return video_vs
-
-def ratingInputHelper(input_data, window_size):
+'''
+This function will return the word2rating mappins
+'''
+def ratingInputHelper(input_data):
+    vectors_ts = input_data['linguistic_timer']
     ratings = input_data['ratings']
-    ts = input_data['ratings_timer']
-    window_size = window_size['ratings']
-
-    current_time = 0.0
-    count_r = 0
-    window_rs = []
+    ratings_ts = input_data['ratings_timer']
     video_rs = []
-    while count_r < len(ratings):
-        t = ts[count_r]
-        if t <= current_time + window_size:
-            window_rs.append(ratings[count_r][0])
-            count_r += 1
-        else:
-            avg_r = sum(window_rs)*1.0/len(window_rs)
-            video_rs.append(avg_r)
-            window_rs = []
-            current_time += window_size
+    # TODO: we have to flat out the ratings
+    ratings_flat = [i[0] for i in ratings]
+    # Linearly interpolating with the actual word time stampes
+    vectors_intra = np.interp(vectors_ts, ratings_ts, ratings_flat)
+    # revert back to 2d for the ratings
+    video_rs = [i for i in vectors_intra]
     return video_rs
 
-'''
-Construct inputs for different channels: emotient, linguistic, ratings, etc..
-'''
-def constructInput(input_data, window_size, channels):
-    ret_input_features = {}
-    ret_ratings = []
-    for data in input_data:
-        # channel features
-        minL = 99999999
-        for channel in channels:
-            video_vs = videoInputHelper(data, window_size, channel)
-            # print("Channel: " + channel + " ; vector size: " + str(len(video_vs)))
-            if channel not in ret_input_features.keys():
-                ret_input_features[channel] = []
-            ret_input_features[channel].append(video_vs)
-            if len(video_vs) < minL:
-                minL = len(video_vs)
-        video_rs = ratingInputHelper(data, window_size)
-        # print("video_rs vector size: " + str(len(video_rs)))
-        if len(video_rs) < minL:
-            minL = len(video_rs)
-        # concate
-        for channel in channels:
-             ret_input_features[channel][-1] = ret_input_features[channel][-1][:minL]
-        ret_ratings.append(video_rs[:minL])
-    return ret_input_features, ret_ratings
 
-def padInputHelper(input_data, dim, old_version=False):
+'''
+Construct inputs with the input linguistic features
+'''
+def constructInput(input_data):
+    # only contains linguistic features
+    video_vs = []
+    video_rs = []
+    for data in input_data:
+        video_vs.append(videoInputHelper(data))
+        video_rs.append(ratingInputHelper(data))
+    return video_vs, video_rs
+
+
+def padInputHelper(input_data):
     output = []
-    max_num_vec_in_window = 0
-    max_num_windows = 0
     seq_lens = []
     for data in input_data:
-        if max_num_windows < len(data):
-            max_num_windows = len(data)
         seq_lens.append(len(data))
-        if max_num_vec_in_window < max([len(w) for w in data]):
-            max_num_vec_in_window = max([len(w) for w in data])
-
-    padVec = [0.0]*dim
+    max_length = max(seq_lens)
+    # padding all the videos into same length
+    padVec = [0.0]*300
     for vid in input_data:
-        vidNewTmp = []
-        for wind in vid:
-            if not old_version:
-                # window might not contain any vector due to null during this window
-                if len(wind) != 0:
-                    windNew = [padVec] * max_num_vec_in_window
-                    # pad with last frame features in this window
-                    windNew[:len(wind)] = wind
-                    vidNewTmp.append(windNew)
-                    # update the pad vec to be the last avaliable vector
-                else:
-                    windNew = [padVec] * max_num_vec_in_window
-                    vidNewTmp.append(windNew)
-            else:
-                windNew = [padVec] * max_num_vec_in_window
-                windNew[:len(wind)] = wind
-                vidNewTmp.append(windNew)
-        vidNew = [[padVec] * max_num_vec_in_window]*max_num_windows
-        vidNew[:len(vidNewTmp)] = vidNewTmp
+        vidNew = [padVec]*max_length
+        vidNew[:len(vid)] = vid
         output.append(vidNew)
     return output, seq_lens
 
 '''
 pad every sequence to max length, also we will be padding windows as well
 '''
-def padInput(input_data, channels, dimensions):
+def padInput(input_data):
     # input_features <- list of dict: {channel_1: [117*features],...}
-    ret = {}
-    seq_lens = []
-    for channel in channels:
-        pad_channel, seq_lens = padInputHelper(input_data[channel], dimensions[channel])
-        ret[channel] = pad_channel
-    return ret, seq_lens
+    padded, seq_lens = padInputHelper(input_data)
+    return padded, seq_lens
 
 def getSeqList(seq_ids):
     ret = []
@@ -523,79 +458,31 @@ def main(args):
     args.device = (torch.device(args.device) if torch.cuda.is_available()
                    else torch.device('cpu'))
 
-    args.modalities = ['image', 'linguistic']
-    mod_dimension = {'linguistic' : 300, 'emotient' : 20, 'acoustic' : 988, 'image' : 1000}
-    window_size = {'linguistic' : 5, 'emotient' : 1, 'acoustic' : 1, 'image' : 1, 'ratings' : 1}
+    args.modalities = ['linguistic']
+    mod_dimension = {'linguistic' : 300}
+    # TODO: In this paper, we remove the concept of time window. each word is mapped to a rating
+    # window_size = {'linguistic' : 5, 'emotient' : 1, 'acoustic' : 1, 'image' : 1, 'ratings' : 5}
 
     # loss function define
     criterion = nn.MSELoss(reduction='sum')
-
-    # TODO: case for only making prediction on eval/test set
-    if args.test or args.eval:
-        eval_dir = "Test"
-        if args.eval:
-            eval_dir = "Valid"
-        print("evaluating on the " + eval_dir + " Set.")
-        TOP_COUNT = 6
-        # this data will contain rating but will be excluded for usage
-        eval_data = load_data(args.modalities, args.data_dir, eval_dir)
-        input_features_eval, ratings_eval = constructInput(eval_data, channels=args.modalities, window_size=window_size)
-        input_padded_eval, seq_lens_eval = padInput(input_features_eval, args.modalities, mod_dimension)
-        ratings_padded_eval = padRating(ratings_eval, max(seq_lens_eval))
-        model_path = os.path.join("../model_save/EF", "TWEF_LV.pth")
-        checkpoint = load_checkpoint(model_path, args.device)
-        # load the testing parameters
-        args.modalities = checkpoint['modalities']
-        mod_dimension = checkpoint['mod_dimension']
-        window_size = checkpoint['window_size']
-        # construct model
-        model = MultiCNNTransformer(mods=args.modalities, dims=mod_dimension, device=args.device)
-        model.load_state_dict(checkpoint['model'])
-        ccc, pred, actuals = \
-            evaluateOnEval(input_padded_eval, ratings_padded_eval, seq_lens_eval,
-                           model, criterion, args)
-        stats = {'ccc': np.mean(ccc), 'ccc_std': np.std(ccc)}
-        logger.info('Evaluation\tCCC(std): {:2.5f}({:2.5f})'.\
-            format(stats['ccc'], stats['ccc_std']))
-        seq_ids = getSeqList(eval_data.seq_ids)
-        seq_pred = dict(zip(seq_ids, pred))
-        seq_actual = dict(zip(seq_ids, actuals))
-        if args.eval:
-            seq_f = "121_3"
-            pred_f = seq_pred["121_3"]
-            actual_f = seq_actual["121_3"]
-        else:
-            seq_f = "169_2"
-            pred_f = seq_pred["169_2"]
-            actual_f = seq_actual["169_2"]
-        output_name = "TWEF_" + seq_f
-        with open("../pred_save/"+output_name+".csv", mode='w') as f:
-            f_writer = csv.writer(f, delimiter=',')
-            f_writer.writerow(['time', 'pred', 'actual'])
-            t = 0
-            for i in range(0, len(pred_f)):
-                f_writer.writerow([t, pred_f[i], actual_f[i]])
-                t = t + 1
-        return
-
     # construct model
-    model = MultiCNNTransformer(mods=args.modalities, dims=mod_dimension, device=args.device)
+    model = ProbeLinear(dims=mod_dimension['linguistic'], device=args.device)
     # Setting the optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(optimizer,mode='min',patience=100,factor=0.5,verbose=True)
     # Load data for specified modalities
+    # training data: essentially two lists of features and ratings for all videos
     train_data, test_data = load_data(args.modalities, args.data_dir)
-    # training data
-    input_features_train, ratings_train = constructInput(train_data, channels=args.modalities, window_size=window_size)
-    input_padded_train, seq_lens_train = padInput(input_features_train, args.modalities, mod_dimension)
+    input_features_train, ratings_train = constructInput(train_data)
+    input_padded_train, seq_lens_train = padInput(input_features_train)
     ratings_padded_train = padRating(ratings_train, max(seq_lens_train))
     # testing data
-    input_features_test, ratings_test = constructInput(test_data, channels=args.modalities, window_size=window_size)
-    input_padded_test, seq_lens_test = padInput(input_features_test, args.modalities, mod_dimension)
+    input_features_test, ratings_test = constructInput(test_data)
+    input_padded_test, seq_lens_test = padInput(input_features_test)
     ratings_padded_test = padRating(ratings_test, max(seq_lens_test))
 
-    # TODO: could remove this if accept dictionary inputs
-    # input_padded_train = {'linguistic' : [117*39*33*300], 'emotient' : []}
+    # # TODO: could remove this if accept dictionary inputs
+    # # input_padded_train = {'linguistic' : [117*39*33*300], 'emotient' : []}
     input_train = input_padded_train
     input_test = input_padded_test
 
@@ -615,8 +502,8 @@ def main(args):
                 scheduler.step(loss)
             if stats['ccc'] > best_ccc:
                 best_ccc = stats['ccc']
-                path = os.path.join("../lstm_save", 'TWEF_ALV.pth')
-                save_checkpoint(args.modalities, mod_dimension, window_size, model, path)
+                path = os.path.join("../lstm_save", 'ENMLP_Transformer.pth')
+                save_checkpoint(args.modalities, mod_dimension, model, path)
             if stats['max_ccc'] > single_best_ccc:
                 single_best_ccc = stats['max_ccc']
                 logger.info('===single_max_predict===')
@@ -637,9 +524,9 @@ if __name__ == "__main__":
                         help='input batch size for training (default: 10)')
     parser.add_argument('--split', type=int, default=1, metavar='N',
                         help='sections to split each video into (default: 1)')
-    parser.add_argument('--epochs', type=int, default=700, metavar='N',
+    parser.add_argument('--epochs', type=int, default=7000, metavar='N',
                         help='number of epochs to train (default: 1000)')
-    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
+    parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                         help='learning rate (default: 1e-6)')
     parser.add_argument('--sup_ratio', type=float, default=0.5, metavar='F',
                         help='teacher-forcing ratio (default: 0.5)')
